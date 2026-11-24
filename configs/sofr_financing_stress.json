@@ -1,0 +1,6 @@
+{
+  "name": "sofr_financing_stress_experiment",
+  "source": "sofr_scenario",
+  "lag_months": 1,
+  "financing_stress_bp": 50.0
+}

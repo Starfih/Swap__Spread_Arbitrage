@@ -1,0 +1,27 @@
+{
+  "name": "sofr_par_bond_scenario",
+  "source": "sofr_scenario",
+  "lag_months": 1,
+  "index_denominator": "active",
+  "funding_spread_bp": 0.0,
+  "initial_cash": 1000.0,
+  "max_gross_leverage": 10.0,
+  "max_repo_borrowing": 5000.0,
+  "treasury_haircut": 0.02,
+  "swap_initial_margin": 0.02,
+  "tenors": [
+    2,
+    3,
+    5,
+    10
+  ],
+  "notional": 100.0,
+  "threshold_bp": 10.0,
+  "hedge": "equal_notional",
+  "force_close_final": false,
+  "treasury_full_spread": 0.03125,
+  "swap_full_spread_bp": 1.0,
+  "repo_full_spread_bp": 10.0,
+  "financing_stress_bp": 0.0,
+  "max_unsecured_borrowing": 0.0
+}

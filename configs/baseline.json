@@ -1,0 +1,14 @@
+{
+  "name": "paper_baseline",
+  "source": "baseline",
+  "market_file": "data/baseline_monthly.json",
+  "tenors": [2, 3, 5, 10],
+  "notional": 100.0,
+  "threshold_bp": 10.0,
+  "hedge": "equal_notional",
+  "lag_months": 0,
+  "index_denominator": "active",
+  "treasury_full_spread": 0.03125,
+  "swap_full_spread_bp": 1.0,
+  "repo_full_spread_bp": 10.0
+}
