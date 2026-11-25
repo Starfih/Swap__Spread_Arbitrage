@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parent
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Simple monthly swap-spread backtest")
+    parser = argparse.ArgumentParser(description="Funded swap-spread backtest")
     parser.add_argument("--config", default="configs/sofr_scenario.json")
     parser.add_argument("--output", default="outputs")
     args = parser.parse_args()
@@ -21,7 +21,7 @@ def main():
                 raise ValueError("LIBOR baseline data is missing. Use the SOFR scenario config; see README.md assumptions.")
             markets = load_baseline(path)
         else:
-            markets = sofr_scenario(ROOT / "SSA_Data", config.funding_spread_bp)
+            markets = sofr_scenario(ROOT / "SSA_Data", config.funding_spread_bp, config.frequency)
         result = run(markets, config, funded=True)
         save_results(result, markets, config, ROOT / args.output)
         print(f"Saved summary.md, trades.csv, equity.csv and chart.png to {ROOT / args.output}")

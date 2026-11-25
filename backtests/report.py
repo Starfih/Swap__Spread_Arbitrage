@@ -9,10 +9,11 @@ import matplotlib.pyplot as plt
 def save_results(result, markets, config, output):
     output.mkdir(parents=True, exist_ok=True)
     account, trades, ledger = result["portfolio"].copy(), result["trades"].copy(), result["ledger"]
-    if account.reconciliation_error.abs().max() > 1e-8:
+    tolerance = max(1e-8, config.initial_cash * 1e-12)
+    if account.reconciliation_error.abs().max() > tolerance:
         raise ValueError("Portfolio P&L does not reconcile")
-    if not ledger.empty and (ledger.reconciliation_error.abs().max() > 1e-8 or
-                             abs(ledger.net_pnl.sum()-trades.total_net.sum()) > 1e-8):
+    if not ledger.empty and (ledger.reconciliation_error.abs().max() > tolerance or
+                             abs(ledger.net_pnl.sum()-trades.total_net.sum()) > tolerance):
         raise ValueError("Trade P&L does not reconcile")
     account["drawdown_pct"] = 100*(account.equity/account.equity.cummax().clip(lower=config.initial_cash)-1)
     account["cumulative_net_trading_pnl"] = account.net_pnl.cumsum()
@@ -20,11 +21,13 @@ def save_results(result, markets, config, output):
              "cumulative_net_trading_pnl", "drawdown_pct", "active_trades", "gross_notional",
              "repo_debt", "free_cash"]].to_csv(output/"equity.csv", index=False, float_format="%.8f")
 
+    holding_unit = "days" if config.frequency == "daily" else "months"
+    holding_column = holding_unit + "_held"
     columns = ["trade_id", "tenor_years", "position", "signal_date", "entry_date", "exit_date",
                "status", "entry_reason", "exit_reason", "entry_signal_bp", "exit_signal_bp",
                "swap_notional", "treasury_face", "swap_fixed_rate_pct", "treasury_coupon_pct",
                "entry_bond_clean", "exit_bond_clean", "entry_swap_value", "exit_swap_value",
-               "months_held", "gross_pnl", "costs", "net_pnl"]
+               holding_column, "gross_pnl", "costs", "net_pnl"]
     annotations = []
     for t in trades.itertuples():
         events = ledger[ledger.trade_id == t.id]
@@ -40,10 +43,10 @@ def save_results(result, markets, config, output):
             swap_notional=t.swap_notional, treasury_face=t.bond_notional,
             swap_fixed_rate_pct=t.swap_coupon*100, treasury_coupon_pct=t.bond_coupon*100,
             entry_bond_clean=entry.bond_clean*100,
-            exit_bond_clean=last.bond_clean*100 if last is not None and t.age < t.tenor*12 else np.nan,
+            exit_bond_clean=last.bond_clean*100 if last is not None and t.exit_reason != "maturity" else np.nan,
             entry_swap_value=entry.swap_unit*t.swap_notional,
             exit_swap_value=last.swap_unit*t.swap_notional if last is not None else np.nan,
-            months_held=t.age, gross_pnl=t.total_gross, costs=t.total_gross-t.total_net, net_pnl=t.total_net))
+            **{holding_column: t.age}, gross_pnl=t.total_gross, costs=t.total_gross-t.total_net, net_pnl=t.total_net))
     pd.DataFrame(annotations, columns=columns).to_csv(output/"trades.csv", index=False, float_format="%.8f")
 
     # Fold initial execution costs into the first complete return interval.
@@ -53,8 +56,8 @@ def save_results(result, markets, config, output):
     changes[0] += account.equity.iloc[0]-config.initial_cash
     returns = changes/previous
     excess = (changes-account.cash_interest.to_numpy()[1:])/previous
-    vol = np.std(excess, ddof=1)*np.sqrt(12) if len(excess)>1 else np.nan
-    sharpe = np.mean(excess)*12/vol if vol > 1e-12 else np.nan
+    vol = np.std(excess, ddof=1)*np.sqrt(config.periods_per_year) if len(excess)>1 else np.nan
+    sharpe = np.mean(excess)*config.periods_per_year/vol if vol > 1e-12 else np.nan
     closed = trades[trades.closed] if not trades.empty else trades
     open_trades = trades[~trades.closed] if not trades.empty else trades
     realized = closed.total_net.sum()
@@ -67,7 +70,7 @@ def save_results(result, markets, config, output):
     summary = f"""# {config.name}
 
 {'HYPOTHETICAL SOFR / PAR-BOND SCENARIO' if config.source=='sofr_scenario' else 'LIBOR baseline rules; replication unverified'}
-Period: {account.date.iloc[0].date()} to {account.date.iloc[-1].date()} ({len(account)-1} monthly intervals).
+Period: {account.date.iloc[0].date()} to {account.date.iloc[-1].date()} ({len(account)-1} {config.frequency} intervals).
 All money amounts are dollars. Unscaled funded portfolio; no retrospective volatility scaling.
 
 | Statistic | Result |
@@ -83,7 +86,7 @@ All money amounts are dollars. Unscaled funded portfolio; no retrospective volat
 | Total return including cash interest (%) | {fmt(100*(account.equity.iloc[-1]/config.initial_cash-1))} |
 | Annualized total return including cash interest (%) | {fmt(cagr)} |
 | Maximum NAV drawdown (%) | {fmt(account.drawdown_pct.min())} |
-| Sharpe: monthly trading excess return, annualized | {fmt(sharpe)} |
+| Sharpe: {config.frequency} trading excess return, annualized | {fmt(sharpe)} |
 | Annualized trading excess-return volatility (%) | {fmt(vol*100)} |
 | Trades entered / closed / still open | {len(trades)} / {len(closed)} / {len(open_trades)} |
 | Closed-trade win rate (%) | {fmt(win)} |
@@ -93,7 +96,7 @@ All money amounts are dollars. Unscaled funded portfolio; no retrospective volat
 
 `chart.png`: triangles mark executed entries and crosses mark exits for each maturity.
 `trades.csv`: exact trade IDs, signal/entry/exit dates, position, size, reasons,
-modeled clean prices per $100 face, swap values, holding months and gross/net P&L.
+modeled clean prices per $100 face, swap values, holding {holding_unit} and gross/net P&L.
 Execution uses modeled prices plus separately charged spread costs. Rates are percentages.
 Matured Treasury redemption is $100; its exit clean-price field is blank after payment.
 Open trades have no exit date and retain marked P&L. Set `force_close_final` to true to
@@ -101,15 +104,15 @@ liquidate them at the last observation and charge exit costs.
 
 ## Assumptions used for this run
 
-- Sizing: `{config.hedge}`; base swap notional ${config.notional:g}; prior-risk sizing {config.risk_sizing}.
+- Sizing: `{config.hedge}`; base swap notional ${config.notional:,.0f}; prior-risk sizing {config.risk_sizing}.
   Tenors {list(config.tenors)}; entry threshold ±{config.threshold_bp:g} bp.
-- Signal lag: {config.lag_months} month(s). Convergence uses each trade's remaining maturity.
-- Monthly overlapping trades; each has its own original coupon and maturity.
+- Signal lag: {config.signal_lag} market observation(s). Convergence uses each trade's remaining maturity.
+- {config.frequency.capitalize()} overlapping trades; each has its own original coupon and maturity.
 - Treasury full bid-ask {config.treasury_full_spread:g} dollars per $100; swap {config.swap_full_spread_bp:g} bp;
   repo {config.repo_full_spread_bp:g} bp. Half widths charged per side; repo drag accrues over time.
 - Funding basis {config.funding_spread_bp:g} bp over SOFR; extra adverse funding stress {config.financing_stress_bp:g} bp.
 - Treasury haircut {config.treasury_haircut*100:g}%; swap margin {config.swap_initial_margin*100:g}%;
-  gross notional/equity limit {config.max_gross_leverage:g}x; repo borrowing cap ${config.max_repo_borrowing:g}.
+  gross notional/equity limit {config.max_gross_leverage:g}x; repo borrowing cap ${config.max_repo_borrowing:,.0f}.
 - Missing short-end curves, hypothetical par bonds and funding assumptions materially affect results.
   The supplied data cannot establish Table 1 replication or actual-security returns. See README.md.
 """
@@ -124,7 +127,7 @@ liquidate them at the last observation and charge exit costs.
     colors = plt.get_cmap("tab10")
     for i, tenor in enumerate(config.tenors):
         dates = [m.date for m in markets]
-        spread = [(m.swap.par(tenor*12)-m.treasury.par(tenor*12))*10000 for m in markets]
+        spread = [(m.signal(tenor*12) + m.short_spread)*10000 for m in markets]
         axes[2].plot(dates, spread, color=colors(i), linewidth=1, label=f"{tenor}Y modeled spread")
         if not ledger.empty:
             for kind, marker in (("entry", "^"), ("exit", "x")):

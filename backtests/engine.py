@@ -1,4 +1,4 @@
-"""Monthly swap-spread engine. Assumptions and usage: ../README.md."""
+"""Swap-spread engine. Assumptions and usage: ../README.md."""
 from dataclasses import dataclass, asdict, fields
 from pathlib import Path
 import csv
@@ -66,7 +66,7 @@ class Curve:
         return cls(times, discounts, np.asarray(forwards))
 
     @classmethod
-    def bootstrap(cls, par_rates, anchor_discount, date, frequency=6, daycount="bond"):
+    def bootstrap(cls, par_rates, anchor_discount, date, frequency=6, daycount="bond", daily=False):
         knots = np.array(sorted(par_rates), float)
         rates = np.array([par_rates[x] for x in knots], float)
         step = frequency / 12
@@ -76,16 +76,25 @@ class Curve:
         spline = CubicSpline(knots, rates, bc_type="natural", extrapolate=False)
         grid = np.arange(step, knots[-1] + 1e-8, step)
         dfs, annuity = [], 0.0
+        node_months = [0, 3, *(int(round(t * 12)) for t in grid)]
+        if daily:
+            dates = {m: date + pd.DateOffset(months=m) for m in node_months}
+            times = [(dates[m] - date).days / 365 for m in node_months]
+        else:
+            times = [m / 12 for m in node_months]
         for t in grid:
             m = int(round(t * 12))
-            a = step if daycount == "bond" else act360(month_end(date, m-frequency), month_end(date, m))
+            a = step
+            if daycount != "bond":
+                a = (act360(dates[m-frequency], dates[m]) if daily else
+                     act360(month_end(date, m-frequency), month_end(date, m)))
             c = float(spline(t))
             df = (1 - c * annuity) / (1 + c * a)
             if not np.isfinite(df) or df <= 0:
                 raise ValueError("Par bootstrap produced nonpositive discount factor")
             dfs.append(df)
             annuity += a * df
-        return cls.from_discounts([0, .25, *grid], [1, anchor_discount, *dfs])
+        return cls.from_discounts(times, [1, anchor_discount, *dfs])
 
     def df(self, t):
         t = np.asarray(t, float)
@@ -129,21 +138,33 @@ class Market:
     mode: str = "libor"
     overnight_factor: float = 1.0  # Realized factor since previous market observation.
 
+    frequency: str = "monthly"
+    # Known overnight factors for individual calendar days ending at this observation.
+    daily_factors: tuple = ()
+
     @property
     def short_spread(self):
         return self.floating - self.repo
 
     def signal(self, remaining):
+        if self.frequency == "daily":
+            from .daily import calendar_schedule, par_spread
+            return par_spread(self, calendar_schedule(self.date, remaining))
         return self.swap.par(remaining) - self.treasury.par(remaining) - self.short_spread
 
 
 def validate_markets(markets):
     if len(markets) < 2:
-        raise ValueError("At least two monthly observations required")
+        raise ValueError("At least two market observations required")
     for i, m in enumerate(markets):
-        if m.date != month_end(m.date) or m.available_at > m.date or m.observed_at > m.available_at:
-            raise ValueError("Invalid month-end clock or future/unavailable observation")
-        if i and m.date != month_end(markets[i-1].date, 1):
+        if m.available_at > m.date or m.observed_at > m.available_at:
+            raise ValueError("Future or unavailable market observation")
+        if m.frequency != markets[0].frequency or (i and m.date <= markets[i-1].date):
+            raise ValueError("Mixed frequencies or unordered market observations")
+        if m.frequency == "daily" and i and len(m.daily_factors) != (m.date-markets[i-1].date).days:
+            raise ValueError("Missing daily financing accruals")
+        if m.frequency == "monthly" and (m.date != month_end(m.date) or
+                (i and m.date != month_end(markets[i-1].date, 1))):
             raise ValueError("Missing monthly observations; do not forward fill curves")
         if m.mode != markets[0].mode or not np.isfinite([m.floating, m.repo, m.cash_rate, m.overnight_factor]).all():
             raise ValueError("Mixed rate regimes or invalid rates")
@@ -174,7 +195,7 @@ def load_baseline(path):
     return markets
 
 
-def sofr_scenario(root, funding_spread_bp=0.0):
+def sofr_scenario(root, funding_spread_bp=0.0, frequency="daily"):
     """Hypothetical par bonds and SOFR-plus-spread funding; never called baseline."""
     root = Path(root) / "CSV's"
     dfs = {p.name: bloomberg_csv(p)[1] for p in root.glob("*.csv")}
@@ -183,13 +204,16 @@ def sofr_scenario(root, funding_spread_bp=0.0):
     # A dated overnight fixing is conservatively available only on the next exported business row.
     rates = dfs["ONF_MR.csv"]["SOFRRATE Index|PX_LAST"].shift(1).dropna()/100
     common = treasury.index.intersection(swaps.index).intersection(rates.index)
+    daily_clock = frequency == "daily"
+    if frequency not in ("monthly", "daily") or common.empty:
+        raise ValueError("Invalid frequency or empty SOFR market history")
+    calendar_rates = rates.reindex(pd.date_range(rates.index.min(), rates.index.max())).ffill()
     final_month = common.max().to_period("M")
     dates = pd.Series(common, index=common).groupby(common.to_period("M")).last()
+    observations = ((dt, dt) for dt in common) if daily_clock else (
+        (period.to_timestamp("M"), dt) for period, dt in dates.items() if period < final_month)
     markets = []
-    for period, observed in dates.items():
-        if period >= final_month:
-            continue  # Incomplete final month is never promoted to a full monthly observation.
-        date = period.to_timestamp("M")
+    for date, observed in observations:
         t = {float(k): float(treasury.loc[observed, f"USGG{k}YR Index|PX_LAST"])/100
              for k in (2, 3, 5, 7, 10)}
         s = {float(k): float(swaps.loc[observed, f"USOSFR{k} Curncy|PX_LAST"])/100
@@ -200,21 +224,24 @@ def sofr_scenario(root, funding_spread_bp=0.0):
         # Explicit unsupported short-end assumptions, recorded in scenario metadata.
         t.update({.5: t[2.], 1.: t[2.]})
         tdf = (1+t[2.]/2)**(-.5)
-        days = (month_end(date, 12)-date).days
+        advance_date = (lambda m: date + pd.DateOffset(months=m)) if daily_clock else (lambda m: month_end(date, m))
+        days = (advance_date(12)-date).days
         s[1.] = ((1+overnight/360)**days - 1)/(days/360)
-        sdf = (1+overnight/360)**(-(month_end(date, 3)-date).days)
+        sdf = (1+overnight/360)**(-(advance_date(3)-date).days)
         factor = 1.0
+        factors = ()
         if markets:
             daily = pd.date_range(markets[-1].date, date-pd.Timedelta(days=1), freq="D")
-            known = rates.reindex(rates.index.union(daily)).sort_index().ffill().reindex(daily)
+            known = calendar_rates.reindex(daily)
             if known.isna().any():
                 raise ValueError("Missing realized SOFR fixings")
-            factor = float(np.prod(1+known.to_numpy()/360))
+            factors = tuple(1+known.to_numpy()/360)
+            factor = float(np.prod(factors))
         markets.append(Market(date, pd.Timestamp(observed), pd.Timestamp(observed),
-                              Curve.bootstrap(t, tdf, date),
-                              Curve.bootstrap(s, sdf, date, frequency=12, daycount="act360"),
+                              Curve.bootstrap(t, tdf, date, daily=daily_clock),
+                              Curve.bootstrap(s, sdf, date, frequency=12, daycount="act360", daily=daily_clock),
                               overnight, overnight+funding_spread_bp/10000, overnight,
-                              "sofr_scenario", factor))
+                              "sofr_scenario", factor, frequency, factors if daily_clock else ()))
     validate_markets(markets)
     return markets
 
@@ -252,7 +279,24 @@ class Config:
     risk_target_notional_vol: float = .01
     max_size_multiplier: float = 2.0
 
+    frequency: str = "monthly"
+    lag_observations: int | None = None
+
+    @property
+    def signal_lag(self):
+        return self.lag_months if self.lag_observations is None else self.lag_observations
+
+    @property
+    def periods_per_year(self):
+        return 252 if self.frequency == "daily" else 12
+
     def __post_init__(self):
+        if self.frequency not in ("daily", "monthly") or (self.source == "baseline" and self.frequency != "monthly"):
+            raise ValueError("Daily market data requires the SOFR scenario")
+        if self.frequency == "daily" and (self.lag_months or self.lag_observations != 1):
+            raise ValueError("Daily SOFR requires one prior market observation")
+        if self.lag_observations not in (None, 0, 1):
+            raise ValueError("Signal lag must be zero or one observation")
         if self.source not in ("baseline", "sofr_scenario"):
             raise ValueError("Unknown data regime")
         if self.hedge not in ("equal_notional", "dv01") or self.index_denominator not in ("active", "retain_cash"):
@@ -295,7 +339,7 @@ def converged(direction, remaining_signal):
 def prior_size(history, config):
     if not config.risk_sizing or len(history) < config.risk_min_history:
         return 1.0
-    vol = np.std(history[-config.risk_lookback:], ddof=1)*np.sqrt(12)
+    vol = np.std(history[-config.risk_lookback:], ddof=1)*np.sqrt(config.periods_per_year)
     if vol < 1e-12:
         return config.max_size_multiplier
     return min(config.max_size_multiplier, config.risk_target_notional_vol/vol)
@@ -415,12 +459,11 @@ class Trade:
 
 
 def open_trade(id, tenor, direction, index, market, signal_market, notional, config):
-    frequency = 12 if market.mode == "sofr_scenario" else 6
-    dc = "act360" if frequency == 12 else "bond"
-    trade = Trade(id, tenor, direction, index, market.date, signal_market.date,
-                  signal_market.signal(tenor*12), notional, notional,
-                  market.swap.par(tenor*12, frequency, market.date, dc), market.treasury.par(tenor*12),
-                  market.floating, market.repo, market.mode)
+    if market.frequency == "daily":
+        from .daily import new_daily_trade
+        trade = new_daily_trade(id, tenor, direction, index, market, signal_market, notional)
+    else:
+        trade = new_monthly_trade(id, tenor, direction, index, market, signal_market, notional)
     if config.hedge == "dv01":
         swap_dv, bond_dv = trade.dv01(market)
         if swap_dv <= 0 or bond_dv <= 0:
@@ -429,6 +472,17 @@ def open_trade(id, tenor, direction, index, market, signal_market, notional, con
     tb, sw = trade.execution_cost(market, config)
     trade.cash_net = -tb-sw
     trade.mark(market, config)
+    return trade
+
+
+
+def new_monthly_trade(id, tenor, direction, index, market, signal_market, notional):
+    frequency = 12 if market.mode == "sofr_scenario" else 6
+    dc = "act360" if frequency == 12 else "bond"
+    trade = Trade(id, tenor, direction, index, market.date, signal_market.date,
+                  signal_market.signal(tenor*12), notional, notional,
+                  market.swap.par(tenor*12, frequency, market.date, dc), market.treasury.par(tenor*12),
+                  market.floating, market.repo, market.mode)
     return trade
 
 
@@ -462,6 +516,8 @@ def close_trade(trade, market, config, reason, flows):
 
 
 def advance(trade, market, config):
+    if market.frequency == "daily":
+        return trade.advance_daily(market, config)
     flows = empty_flows()
     trade.age += 1
     d, ns, nb, age = trade.direction, trade.swap_notional, trade.bond_notional, trade.age
@@ -508,7 +564,8 @@ def record(trade, market, config, event, flows, before, reason="", exit_signal=n
     row = dict(date=market.date, trade_id=trade.id, tenor=trade.tenor, event=event,
                reason=reason, direction=d, signal_date=trade.signal_date,
                entry_signal_bp=trade.entry_signal*10000, exit_signal_bp=exit_signal*10000,
-               age_months=trade.age, remaining_months=trade.remaining,
+               **({"age_days": trade.age, "remaining_days": trade.remaining} if market.frequency == "daily"
+                  else {"age_months": trade.age, "remaining_months": trade.remaining}),
                swap_notional=trade.swap_notional, treasury_face=trade.bond_notional,
                swap_coupon=trade.swap_coupon, treasury_coupon=trade.bond_coupon,
                floating_reset=trade.float_reset, repo_reset=trade.repo_reset,
@@ -567,11 +624,13 @@ def run(markets, config, funded=False):
     validate_markets(markets)
     if (config.source == "baseline") != (markets[0].mode == "libor"):
         raise ValueError("Configuration and instrument regime disagree")
+    if config.frequency != markets[0].frequency:
+        raise ValueError("Configuration and observation frequency disagree")
     trades, ledger, decisions, portfolio, indexes = [], [], [], [], []
     cash, previous_equity = config.initial_cash, config.initial_cash
     history, pending_first, ever_cohorts = [], {t: [0., 0.] for t in config.tenors}, {t: 0 for t in config.tenors}
     for i, m in enumerate(markets):
-        month_rows = []
+        period_rows = []
         active_before = {tenor: sum(not t.closed and t.tenor == tenor for t in trades) for tenor in config.tenors}
         cash_interest = 0.
         if funded and i:
@@ -581,16 +640,18 @@ def run(markets, config, funded=False):
         for t in [t for t in trades if not t.closed]:
             before = state(t)
             flows = advance(t, m, config)
-            sm = markets[max(0, i-config.lag_months)]
-            remaining_at_decision = t.remaining+config.lag_months
-            signal = sm.signal(remaining_at_decision) if t.remaining > 0 else np.nan
+            sm = markets[max(0, i-config.signal_lag)]
+            signal = np.nan
+            if t.remaining > 0:
+                signal = (t.remaining_signal(sm) if config.frequency == "daily" else
+                          sm.signal(t.remaining+config.signal_lag))
             reason = "maturity" if t.remaining == 0 else "convergence" if converged(t.direction, signal) else ""
             if config.force_close_final and i == len(markets)-1 and not reason:
                 reason = "sample_end_liquidation"
             if reason:
                 close_trade(t, m, config, reason, flows)
             row = record(t, m, config, "exit" if reason else "mark", flows, before, reason, signal)
-            month_rows.append(row)
+            period_rows.append(row)
             cash += row["cash_change_net"]
         if funded:
             for t in [t for t in trades if not t.closed]:
@@ -599,7 +660,7 @@ def run(markets, config, funded=False):
                 before, flows = state(t), empty_flows()
                 close_trade(t, m, config, "capital_constraint", flows)
                 row = record(t, m, config, "exit", flows, before, "capital_constraint")
-                month_rows.append(row)
+                period_rows.append(row)
                 cash += row["cash_change_net"]
         can_start = i < len(markets)-1
         size = prior_size(history, config)
@@ -607,12 +668,12 @@ def run(markets, config, funded=False):
             if not can_start:
                 continue
             ever_cohorts[tenor] += 1
-            sm = markets[max(0, i-config.lag_months)]
+            sm = markets[max(0, i-config.signal_lag)]
             signal = sm.signal(tenor*12)
-            direction = entry_direction(signal, config.threshold_bp) if i >= config.lag_months else 0
+            direction = entry_direction(signal, config.threshold_bp) if i >= config.signal_lag else 0
             decision = dict(date=m.date, signal_date=sm.date, tenor=tenor, signal_bp=signal*10000,
                             direction=direction, size_multiplier=size,
-                            reason="inside_band" if i >= config.lag_months else "signal_warmup")
+                            reason="inside_band" if i >= config.signal_lag else "signal_warmup")
             if direction:
                 candidate = open_trade(len(trades)+1, tenor, direction, i, m, sm,
                                        config.notional*size, config)
@@ -629,13 +690,13 @@ def run(markets, config, funded=False):
                                  treasury_trade_cash=-direction*candidate.bond_notional,
                                  funding_principal_cash=direction*candidate.bond_notional)
                     row = record(candidate, m, config, "entry", flows, (0.,)*6, reason)
-                    month_rows.append(row)
+                    period_rows.append(row)
                     cash += row["cash_change_net"]
             decisions.append(decision)
         exp = exposure(trades, m, config)
         equity = cash+exp["marks_net"]
-        pnl_net = sum(r["net_pnl"] for r in month_rows)
-        pnl_gross = sum(r["gross_pnl"] for r in month_rows)
+        pnl_net = sum(r["net_pnl"] for r in period_rows)
+        pnl_gross = sum(r["gross_pnl"] for r in period_rows)
         portfolio.append(dict(date=m.date, cash=cash, cash_interest=cash_interest, equity=equity,
                               capital_reserved=exp["collateral_required"],
                               free_cash=cash-exp["collateral_required"],
@@ -647,8 +708,8 @@ def run(markets, config, funded=False):
                               constraints_satisfied=fits(cash, exp, config), **exp))
         previous_equity = equity
         for tenor in config.tenors:
-            g = sum(r["gross_pnl"] for r in month_rows if r["tenor"] == tenor)
-            n = sum(r["net_pnl"] for r in month_rows if r["tenor"] == tenor)
+            g = sum(r["gross_pnl"] for r in period_rows if r["tenor"] == tenor)
+            n = sum(r["net_pnl"] for r in period_rows if r["tenor"] == tenor)
             if i == 0:
                 pending_first[tenor] = [g, n]
                 continue
@@ -663,7 +724,7 @@ def run(markets, config, funded=False):
                                 sum_gross_pnl=g, sum_net_pnl=n,
                                 index_gross_pnl=g/max(denom, 1), index_net_pnl=n/max(denom, 1),
                                 retain_cash_net_pnl=n/max(retained_denom, 1)))
-        ledger.extend(month_rows)
+        ledger.extend(period_rows)
         # Completed unit returns only; current date sizing was already decided above.
         prior_notional = sum(t.swap_notional for t in trades if not t.closed)
         history.append(pnl_net/max(prior_notional, config.notional))

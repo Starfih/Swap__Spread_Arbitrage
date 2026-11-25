@@ -1,6 +1,10 @@
 {
   "name": "sofr_financing_stress_experiment",
   "source": "sofr_scenario",
-  "lag_months": 1,
-  "financing_stress_bp": 50.0
+  "financing_stress_bp": 50.0,
+  "frequency": "daily",
+  "lag_observations": 1,
+  "notional": 1000000,
+  "initial_cash": 10000000,
+  "max_repo_borrowing": 50000000
 }
